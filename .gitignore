@@ -1,0 +1,11 @@
+output/
+cache/
+__pycache__/
+*.pyc
+
+.env
+.DS_Store
+
+live/state.json
+live/state.tmp
+live/farm.log
