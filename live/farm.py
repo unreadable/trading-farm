@@ -27,7 +27,9 @@ from config import (
 from zones import detect_zones
 from structure import compute_atr
 from backtest import find_dynamic_tp
-from data import fetch_ohlcv_full
+import pandas as pd
+
+from data import fetch_ohlcv, fetch_ohlcv_full
 from live.kraken_client import KrakenFuturesClient
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -40,6 +42,11 @@ LEVERAGE = 5           # isolated margin, 5x — enough for our position sizes
 
 # Instrument specs cache (populated at startup)
 _instrument_specs = {}
+
+# OHLCV cache: coin -> DataFrame. Populated/refreshed at each candle close.
+_ohlcv_cache: dict[str, pd.DataFrame] = {}
+_OHLCV_MAX_ROWS = LOOKBACK_DAYS * (86400 // CANDLE_SECONDS)  # 60 * 48 = 2880
+_OHLCV_STALE_GAP = 4 * CANDLE_SECONDS                        # >2h gap triggers full re-fetch
 
 
 def fmt_price(price: float) -> str:
@@ -133,7 +140,7 @@ def compute_signals(df, coin: str, active_trades: list[dict],
     current_price = float(df["close"].iloc[-1])
     current_atr = float(atr_series.iloc[-1])
     if current_atr == 0:
-        return []
+        return [], 0, [], current_price
 
     # Incremental zone activation + freshness walk (matching backtest exactly)
     # Zones are activated on the bar their impulse occurs, then freshness
@@ -255,12 +262,35 @@ def compute_signals(df, coin: str, active_trades: list[dict],
     return signals, fresh_count, active_zones, current_price
 
 
-def get_signals(coin: str, active_trades: list[dict],
-                params: dict) -> list[dict]:
-    """Fetch data + compute signals. Thin wrapper around compute_signals()."""
+def _refresh_ohlcv_cache(coin: str) -> pd.DataFrame:
+    """Return an up-to-date OHLCV DataFrame, using incremental fetch when healthy."""
     ccxt_symbol = CCXT_MAP[coin]
-    df = fetch_ohlcv_full(ccxt_symbol, TIMEFRAME, days=LOOKBACK_DAYS)
+    cached = _ohlcv_cache.get(coin)
 
+    needs_full = (
+        cached is None
+        or cached.empty
+        or (pd.Timestamp.utcnow() - cached.index[-1]).total_seconds() > _OHLCV_STALE_GAP
+    )
+
+    if needs_full:
+        log.info(f"[CACHE] Miss — Full fetch for {coin}")
+        df = fetch_ohlcv_full(ccxt_symbol, TIMEFRAME, days=LOOKBACK_DAYS)
+    else:
+        log.info(f"[CACHE] Hit — Incremental update for {coin}")
+        fresh = fetch_ohlcv(ccxt_symbol, TIMEFRAME, limit=20)
+        df = pd.concat([cached, fresh])
+        df = df[~df.index.duplicated(keep="last")]
+        df.sort_index(inplace=True)
+        df = df.tail(_OHLCV_MAX_ROWS)
+
+    _ohlcv_cache[coin] = df
+    return df
+
+
+def get_signals(coin: str, df: pd.DataFrame, active_trades: list[dict],
+                params: dict) -> list[dict]:
+    """Compute signals from a pre-fetched df. Caller owns the data fetch."""
     signals, fresh_count, active_zones, current_price = compute_signals(
         df, coin, active_trades, params)
 
@@ -409,7 +439,11 @@ def place_sl_tp(client: KrakenFuturesClient, trade: dict):
 
 def check_fills(client: KrakenFuturesClient, state: dict):
     """Check order status and manage trade lifecycle."""
-    open_orders = client.get_open_orders()
+    try:
+        open_orders = client.get_open_orders()
+    except Exception as e:
+        log.error(f"Could not fetch open orders: {e} — skipping fill check")
+        return
     open_order_ids = {o.get("order_id") for o in open_orders}
 
     # Get recent fills — aggregate by cliOrdId (handles partial fills)
@@ -492,55 +526,104 @@ def check_fills(client: KrakenFuturesClient, state: dict):
             sl_alive = trade["sl_order_id"] in open_order_ids
             tp_alive = trade["tp_order_id"] in open_order_ids
 
-            if not sl_alive and tp_alive:
-                # SL filled — cancel TP
-                log.info(f"[{trade['trade_id']}] SL HIT — cancelling TP")
+            # Resolve fills upfront — needed for all branches
+            sl_fill = fills_by_cli.get(f"sd_{trade['trade_id']}_sl")
+            tp_fill = fills_by_cli.get(f"sd_{trade['trade_id']}_tp")
+
+            # If an order disappeared but no fill found yet, retry once for fill latency
+            if (not sl_alive and not sl_fill) or (not tp_alive and not tp_fill):
+                time.sleep(2)
                 try:
-                    client.cancel_order(trade["tp_order_id"])
+                    for f in client.get_fills():
+                        cli = f.get("cliOrdId", "")
+                        size = float(f.get("size", 0))
+                        price = float(f.get("price", 0))
+                        if cli and size > 0 and cli not in fills_by_cli:
+                            fills_by_cli[cli] = {"total_size": size, "avg_price": price}
                 except Exception as e:
-                    log.warning(f"Cancel TP failed: {e}")
-                trade["status"] = "closed"
-                trade["result"] = "loss"
-                trade["pnl_r"] = -1.0
-                trade["closed_at"] = datetime.now(timezone.utc).isoformat()
-                log.info(f"[{trade['trade_id']}] CLOSED: loss (-1R)")
+                    log.warning(f"[{trade['trade_id']}] Fill retry failed: {e}")
+                sl_fill = fills_by_cli.get(f"sd_{trade['trade_id']}_sl")
+                tp_fill = fills_by_cli.get(f"sd_{trade['trade_id']}_tp")
+
+            if not sl_alive and tp_alive:
+                if sl_fill:
+                    # SL actually filled — cancel TP
+                    log.info(f"[{trade['trade_id']}] SL HIT — cancelling TP")
+                    try:
+                        client.cancel_order(trade["tp_order_id"])
+                    except Exception as e:
+                        log.warning(f"Cancel TP failed: {e}")
+                    trade["status"] = "closed"
+                    trade["result"] = "loss"
+                    trade["close_reason"] = "sl"
+                    trade["pnl_r"] = -1.0
+                    trade["closed_at"] = datetime.now(timezone.utc).isoformat()
+                    log.info(f"[{trade['trade_id']}] CLOSED: loss (-1R)")
+                else:
+                    # SL cancelled without fill — reverse/manual close
+                    log.warning(f"[{trade['trade_id']}] SL gone without fill — reverse/manual. Cancelling TP.")
+                    try:
+                        client.cancel_order(trade["tp_order_id"])
+                    except Exception as e:
+                        log.warning(f"Cancel TP failed: {e}")
+                    trade["status"] = "closed"
+                    trade["result"] = "reverse"
+                    trade["close_reason"] = "reverse"
+                    trade["pnl_r"] = 0.0
+                    trade["closed_at"] = datetime.now(timezone.utc).isoformat()
+                    log.warning(f"[{trade['trade_id']}] CLOSED: reverse/manual — RR requires manual reconciliation")
 
             elif sl_alive and not tp_alive:
-                # TP filled — cancel SL
-                log.info(f"[{trade['trade_id']}] TP HIT — cancelling SL")
-                try:
-                    client.cancel_order(trade["sl_order_id"])
-                except Exception as e:
-                    log.warning(f"Cancel SL failed: {e}")
-                trade["status"] = "closed"
-                trade["result"] = "win"
-                trade["pnl_r"] = trade["rr_target"]
-                trade["closed_at"] = datetime.now(timezone.utc).isoformat()
-                log.info(f"[{trade['trade_id']}] CLOSED: win (+{trade['rr_target']:.1f}R)")
+                if tp_fill:
+                    # TP actually filled — cancel SL
+                    log.info(f"[{trade['trade_id']}] TP HIT — cancelling SL")
+                    try:
+                        client.cancel_order(trade["sl_order_id"])
+                    except Exception as e:
+                        log.warning(f"Cancel SL failed: {e}")
+                    trade["status"] = "closed"
+                    trade["result"] = "win"
+                    trade["close_reason"] = "tp"
+                    trade["pnl_r"] = trade["rr_target"]
+                    trade["closed_at"] = datetime.now(timezone.utc).isoformat()
+                    log.info(f"[{trade['trade_id']}] CLOSED: win (+{trade['rr_target']:.1f}R)")
+                else:
+                    # TP cancelled without fill — reverse/manual close (root cause of 2.5R bug)
+                    log.warning(f"[{trade['trade_id']}] TP gone without fill — reverse/manual. Cancelling SL.")
+                    try:
+                        client.cancel_order(trade["sl_order_id"])
+                    except Exception as e:
+                        log.warning(f"Cancel SL failed: {e}")
+                    trade["status"] = "closed"
+                    trade["result"] = "reverse"
+                    trade["close_reason"] = "reverse"
+                    trade["pnl_r"] = 0.0
+                    trade["closed_at"] = datetime.now(timezone.utc).isoformat()
+                    log.warning(f"[{trade['trade_id']}] CLOSED: reverse/manual — RR requires manual reconciliation")
 
             elif not sl_alive and not tp_alive:
                 # Both gone — determine from fills
-                sl_fill = fills_by_cli.get(f"sd_{trade['trade_id']}_sl")
-                tp_fill = fills_by_cli.get(f"sd_{trade['trade_id']}_tp")
                 trade["status"] = "closed"
                 trade["closed_at"] = datetime.now(timezone.utc).isoformat()
                 if tp_fill and not sl_fill:
                     trade["result"] = "win"
+                    trade["close_reason"] = "tp"
                     trade["pnl_r"] = trade["rr_target"]
                 elif sl_fill and not tp_fill:
                     trade["result"] = "loss"
+                    trade["close_reason"] = "sl"
                     trade["pnl_r"] = -1.0
                 else:
-                    # Both filled or neither — check fill prices
                     trade["result"] = "unknown"
+                    trade["close_reason"] = "unknown"
                     trade["pnl_r"] = 0.0
                 log.info(f"[{trade['trade_id']}] CLOSED: {trade['result']} "
                          f"({trade['pnl_r']:+.1f}R)")
 
-    # Move closed trades to completed list
+    # Move closed trades to completed list; keep error_no_sl_tp in active (open position)
     still_active = []
     for trade in state["trades"]:
-        if trade["status"] in ("closed", "cancelled", "error_no_sl_tp"):
+        if trade["status"] in ("closed", "cancelled"):
             if trade["pnl_r"] is not None:
                 state["total_r"] += trade["pnl_r"]
             state["completed"].append(trade)
@@ -715,14 +798,15 @@ def run_farm(coins: list[str], max_trades: int, risk_pct: float):
     while True:
         try:
             now = time.time()
+            wait = next_candle_close()          # M1: captured before any blocking calls
 
             # ── Check fills every POLL_INTERVAL seconds ───────────────
             check_fills(client, state)
+            _recover_unprotected(client, state)
             cancel_stale_entries(client, state)
             save_state(state)
 
             # ── Signal check at candle close ──────────────────────────
-            wait = next_candle_close()
             active_count = len([t for t in state["trades"]
                                 if t["status"] in ("pending_entry", "active")])
 
@@ -740,10 +824,20 @@ def run_farm(coins: list[str], max_trades: int, risk_pct: float):
                             break
 
                         try:
-                            signals = get_signals(coin, state["trades"], params)
+                            df = _refresh_ohlcv_cache(coin)
+                            signals = get_signals(coin, df, state["trades"], params)
                             for sig in signals:
                                 if active_count >= max_trades:
                                     break
+                                conflict = any(
+                                    t.get("coin") == sig["coin"]
+                                    and t.get("side") != sig["side"]
+                                    and t.get("status") in ("pending_entry", "active")
+                                    for t in state["trades"]
+                                )
+                                if conflict:
+                                    log.warning(f"[{coin}] Skipping {sig['side']} signal — opposite position active")
+                                    continue
                                 log.info(f"[{coin}] Signal: {sig['side']} @ ${fmt_price(sig['entry_price'])} "
                                          f"({sig['zone_type']}) RR={sig['rr_target']} "
                                          f"str={sig['strength']:.1f}")
